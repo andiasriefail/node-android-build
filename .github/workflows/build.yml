@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       node_version:
-        description: 'Node 版本: lts(最新LTS) / 主版本(如 24) / 完整版本(如 24.19.0)'
-        default: lts
+        description: 'Node 版本: 24(默认) / lts(最新LTS) / 主版本(如 26) / 完整版本(如 24.19.0)'
+        default: '24'
         required: false
       target_arch:
         description: '目标架构 (all=全部 4 架构)'
@@ -38,7 +38,7 @@ jobs:
       # 提前解析版本 (cache key 需要), 与 build.sh 的 resolve_version 逻辑一致
       - name: Resolve node version
         run: |
-          V="${{ inputs.node_version || 'lts' }}"
+          V="${{ inputs.node_version || '24' }}"
           case "$V" in
             ""|lts|latest)
               VER=$(curl -fsSL --max-time 30 "https://nodejs.org/dist/index.json" | python3 -c 'import json,sys;d=json.load(sys.stdin);l=[x for x in d if x.get("lts")];print(l[0]["version"].lstrip("v") if l else d[0]["version"].lstrip("v"))') ;;
