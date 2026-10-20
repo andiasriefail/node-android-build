@@ -20,7 +20,10 @@
 #   ANDROID_NDK_HOME      NDK 路径 (未设置时自动查找 Actions 预装 / 常见路径)
 #   OUT_DIR               输出目录 (默认 ./out)
 #   NODE_BUILD_BACKEND    ninja|make (默认 ninja)
-#   NODE_STRIP            1=用 llvm-strip 精简 node 二进制 (默认不精简)
+#   NODE_STRIP            1=用 llvm-strip 精简 node 二进制 (默认 1: 应用内置, 体积优先)
+#   NODE_WITH_NPM         1=内置 npm (默认 1; 0=--without-npm)
+#   NODE_PKG_SUFFIX       asset 名后缀 (默认 -full: 含 npm + 精简 + smoke-test.js; 改配置时递增以避开 "已发布则跳过")
+#   NODE_VERIFY           1=构建后用 llvm-readelf 校验架构/依赖库/页对齐 (默认 1)
 # ============================================================
 set -euo pipefail
 
@@ -30,7 +33,10 @@ OUT_DIR="${OUT_DIR:-$(pwd)/out}"
 TARGET_ARCH="${TARGET_ARCH:-arm64}"
 ANDROID_SDK_VERSION="${ANDROID_SDK_VERSION:-24}"
 BACKEND="${NODE_BUILD_BACKEND:-ninja}"
-STRIP="${NODE_STRIP:-0}"
+STRIP="${NODE_STRIP:-1}"
+WITH_NPM="${NODE_WITH_NPM:-1}"
+PKG_SUFFIX="${NODE_PKG_SUFFIX--full}"
+VERIFY="${NODE_VERIFY:-1}"
 
 info() { echo "[*] $1"; }
 warn() { echo "[!] $1"; }
@@ -38,7 +44,7 @@ die()  { echo "[Error] $1"; exit 1; }
 
 # ---------- 解析版本 ----------
 resolve_version() {
-  local v="${NODE_VERSION:-lts}"
+  local v="${NODE_VERSION:-24}"
   case "$v" in
     ""|lts|latest)
       curl -fsSL --max-time 30 "https://nodejs.org/dist/index.json" | python3 -c '
@@ -101,7 +107,7 @@ skip_if_released() {
   if [ -n "${GITHUB_REPOSITORY:-}" ]; then
     local major="${VER%%.*}"
     local tag="node-android-${DEST_CPU}-${major}"
-    local asset="node-android-${DEST_CPU}-${VER}.tar.xz"
+    local asset="node-android-${DEST_CPU}-${VER}${PKG_SUFFIX}.tar.xz"
     if curl -fsSL --max-time 20 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null \
       | grep -q "\"name\": \"${asset}\""; then
       info "$asset 已存在于 release $tag, 跳过构建"
@@ -232,6 +238,11 @@ if [ "$ANDROID_SDK_VERSION" -lt 28 ]; then
 fi
 export CFLAGS
 
+# Android 15+ (16 KB 页): 64 位可执行文件按 16 KB 对齐 (NDK r28+ 默认如此, 旧 NDK 显式指定; 32 位不需要)
+case "$DEST_CPU" in
+  arm64|x64) export LDFLAGS="${LDFLAGS:-} -Wl,-z,max-page-size=16384" ;;
+esac
+
 # ---------- 配置 & 编译 ----------
 info "配置 ..."
 CONFIGURE_ARGS=(
@@ -241,9 +252,12 @@ CONFIGURE_ARGS=(
   --cross-compiling
   --partly-static
   --with-intl=full-icu
-  --without-npm
   --prefix="$OUT_DIR/nodejs-v${VER}-android-${DEST_CPU}"
 )
+# npm: 默认内置 (应用把它和 node 一起打包, 用户无需下载; 运行方式 node <npm 目录>/bin/npm-cli.js)
+[ "$WITH_NPM" = "1" ] || CONFIGURE_ARGS+=(--without-npm)
+# armeabi-v7a 的 Android ABI 是 softfp (显式指定, 不依赖自动检测)
+[ "$DEST_CPU" = "arm" ] && CONFIGURE_ARGS+=(--with-arm-float-abi=softfp)
 # 大版本专属 configure 参数: patches/<大版本>/custom/configure-args (每行一个)
 # 版本差异集中管理在补丁目录, build.sh 保持通用 (如 26 的 Temporal 禁用)
 CONFIG_ARGS_FILE="$PATCH_DIR/custom/configure-args"
@@ -277,10 +291,45 @@ if [ "$STRIP" = "1" ]; then
   "${TOOLCHAIN}/bin/llvm-strip" "$OUT_DIR/nodejs-v${VER}-android-${DEST_CPU}/bin/node"
 fi
 
+# ---------- 校验: 架构 / 依赖库 / 页对齐 ----------
+# CI runner 无法运行 Android 二进制, 所以用 readelf 静态检查 "能不能在手机上加载"
+# 运行级检查由 scripts/smoke-test.js 在手机上完成 (随包发布)
+verify_elf() {
+  local bin="$1" readelf="$TOOLCHAIN/bin/llvm-readelf" machine want bad=0 lib
+  case "$DEST_CPU" in
+    arm64) want="AArch64" ;;
+    arm)   want="ARM" ;;
+    x64)   want="X86-64" ;;
+    ia32)  want="Intel 80386" ;;
+  esac
+  machine=$("$readelf" -h "$bin" | sed -n 's/^ *Machine: *//p')
+  case "$machine" in *"$want"*) info "ELF 架构: $machine" ;; *) warn "架构不符: 期望 $want, 实际 $machine"; bad=1 ;; esac
+  # 只允许 Android 系统自带的稳定库 (libc++_shared.so / libatomic.so 等不在手机上, 会导致无法启动)
+  for lib in $("$readelf" -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+    case "$lib" in
+      libc.so|libm.so|libdl.so|liblog.so|libstdc++.so|libz.so|libandroid.so) info "  依赖: $lib" ;;
+      *) warn "  不允许的依赖库: $lib (手机上不存在, node 将无法启动)"; bad=1 ;;
+    esac
+  done
+  case "$DEST_CPU" in
+    arm64|x64)
+      if "$readelf" -lW "$bin" | awk '$1=="LOAD"{print $NF}' | grep -qvE '^0x(4000|10000|20000)$'; then
+        warn "LOAD 段对齐不是 16 KB: Android 15+ 的 16 KB 页面设备可能拒绝加载"; bad=1
+      fi ;;
+  esac
+  return $bad
+}
+if [ "$VERIFY" = "1" ]; then
+  verify_elf "$OUT_DIR/nodejs-v${VER}-android-${DEST_CPU}/bin/node" || die "ELF 校验失败 (见上方 [!] 警告)"
+fi
+
+# 手机上的冒烟测试 (Studio Mobile 或 adb 里运行: node smoke-test.js)
+cp "$REPO_DIR/scripts/smoke-test.js" "$OUT_DIR/nodejs-v${VER}-android-${DEST_CPU}/smoke-test.js"
+
 info "打包 ..."
-tar -C "$OUT_DIR" -cJf "$OUT_DIR/node-android-${DEST_CPU}-${VER}.tar.xz" \
+tar -C "$OUT_DIR" -cJf "$OUT_DIR/node-android-${DEST_CPU}-${VER}${PKG_SUFFIX}.tar.xz" \
   "nodejs-v${VER}-android-${DEST_CPU}"
 
 echo
-info "完成: $OUT_DIR/node-android-${DEST_CPU}-${VER}.tar.xz"
-ls -lh "$OUT_DIR/node-android-${DEST_CPU}-${VER}.tar.xz"
+info "完成: $OUT_DIR/node-android-${DEST_CPU}-${VER}${PKG_SUFFIX}.tar.xz"
+ls -lh "$OUT_DIR/node-android-${DEST_CPU}-${VER}${PKG_SUFFIX}.tar.xz"
