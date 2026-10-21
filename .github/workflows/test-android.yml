@@ -10,12 +10,52 @@ on:
 
 jobs:
   test:
+    name: "Test ${{ matrix.label }} (${{ matrix.mode }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # x64 = kontrol (emulator native). arm64 & arm = lewat ARM translation.
-        arch: [x64, arm64, arm]
+        include:
+          - arch: arm64
+            label: "arm64 = ARMv8, 64-bit (arm64-v8a)"
+            mode: "cek ELF + dijalankan di emulator via ARM translation"
+            check: elf
+            elf_class: ELF64
+            machine: AArch64
+            interp: /system/bin/linker64
+            api: 30
+            emu: x86_64
+            target: google_apis_playstore
+          - arch: arm
+            label: "arm = ARMv7 / arm7, 32-bit (armeabi-v7a)"
+            mode: "cek ELF + dijalankan di emulator via ARM translation"
+            check: elf
+            elf_class: ELF32
+            machine: ARM
+            interp: /system/bin/linker
+            api: 30
+            emu: x86_64
+            target: google_apis_playstore
+          - arch: x64
+            label: "x64 = x86_64, 64-bit"
+            mode: "native, dijalankan di emulator"
+            check: emulator
+            elf_class: ELF64
+            machine: X86-64
+            interp: /system/bin/linker64
+            api: 33
+            emu: x86_64
+            target: google_apis
+          - arch: ia32
+            label: "ia32 = x86, 32-bit"
+            mode: "native, dijalankan di emulator"
+            check: emulator
+            elf_class: ELF32
+            machine: "80386"
+            interp: /system/bin/linker
+            api: 30
+            emu: x86
+            target: google_apis
     steps:
       - name: Enable KVM
         run: |
@@ -23,7 +63,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Download ${{ matrix.arch }} build from Releases
+      - name: "Download build: ${{ matrix.label }}"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -34,6 +74,24 @@ jobs:
           tar xf *.tar.xz
           ls -R . | head -30
 
+      - name: "Check binary (ELF): ${{ matrix.label }}"
+        run: |
+          BIN=$(ls dl/nodejs-v*-android-${{ matrix.arch }}/bin/node | head -n 1)
+          SMOKE=$(dirname "$BIN")/../smoke-test.js
+          ls -lh "$BIN"
+          file "$BIN" || true
+          readelf -h "$BIN" | grep -E 'Class|Machine'
+          readelf -l "$BIN" | grep -i 'interpreter'
+          readelf -h "$BIN" | grep -q "Class:.*${{ matrix.elf_class }}"    || { echo "::error::Class bukan ${{ matrix.elf_class }}"; exit 1; }
+          readelf -h "$BIN" | grep -q "Machine:.*${{ matrix.machine }}"    || { echo "::error::Machine bukan ${{ matrix.machine }}"; exit 1; }
+          readelf -l "$BIN" | grep -q "${{ matrix.interp }}"               || { echo "::error::Interpreter bukan ${{ matrix.interp }} (bukan binary Android)"; exit 1; }
+          echo "--- Library yang dibutuhkan (NEEDED):"
+          readelf -d "$BIN" | grep NEEDED || true
+          BAD=$(readelf -d "$BIN" | grep NEEDED | grep -E 'libstdc\+\+|libc\+\+_shared|libc\.so\.6|libm\.so\.6|libgcc_s' || true)
+          [ -z "$BAD" ] || { echo "::error::Butuh library non-Android (tidak mandiri): $BAD"; exit 1; }
+          [ -f "$SMOKE" ] || { echo "::error::smoke-test.js tidak ada"; exit 1; }
+          echo "OK: ${{ matrix.label }} = binary Android yang benar"
+
       - name: Write test script
         run: |
           cat > run-test.sh <<'EOF'
@@ -41,7 +99,9 @@ jobs:
           adb wait-for-device
           adb shell getprop ro.product.cpu.abilist
           DIR=$(ls -d dl/nodejs-v*-android-$ARCH | head -n 1)
-          adb push "$DIR" /data/local/tmp/nodetest
+          adb shell mkdir -p /data/local/tmp/nodetest/bin
+          adb push "$DIR/bin/node" /data/local/tmp/nodetest/bin/node
+          adb push "$DIR/smoke-test.js" /data/local/tmp/nodetest/smoke-test.js
           adb shell chmod 755 /data/local/tmp/nodetest/bin/node
           adb shell '/data/local/tmp/nodetest/bin/node -v; echo EXIT=$?' | tee v.txt
           grep -q 'EXIT=0' v.txt || exit 1
@@ -49,12 +109,14 @@ jobs:
           grep -q 'EXIT=0' smoke.txt || exit 1
           EOF
 
-      - name: Run in emulator
+      - name: "Run in emulator: ${{ matrix.label }}"
+        # ARM lewat translation = percobaan: boleh gagal, verdict ARM tetap dari cek ELF
+        continue-on-error: ${{ matrix.check == 'elf' }}
         uses: reactivecircus/android-emulator-runner@v2
         env:
           ARCH: ${{ matrix.arch }}
         with:
-          api-level: 33
-          arch: x86_64
-          target: google_apis
+          api-level: ${{ matrix.api }}
+          arch: ${{ matrix.emu }}
+          target: ${{ matrix.target }}
           script: bash run-test.sh

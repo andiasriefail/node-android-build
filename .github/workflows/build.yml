@@ -26,7 +26,11 @@ permissions:
 
 jobs:
   build:
+    name: build ${{ matrix.arch }} (${{ fromJSON('{"arm64":"ARMv8 64-bit","arm":"ARMv7 32-bit (arm7)","x64":"x86_64 64-bit","ia32":"x86 32-bit"}')[matrix.arch] }})
     runs-on: ubuntu-latest
+    env:
+      ARCH_LABEL: ${{ fromJSON('{"arm64":"ARMv8 64-bit","arm":"ARMv7 32-bit (arm7)","x64":"x86_64 64-bit","ia32":"x86 32-bit"}')[matrix.arch] }}
+      ARCH_ABI: ${{ fromJSON('{"arm64":"arm64-v8a","arm":"armeabi-v7a","x64":"x86_64","ia32":"x86"}')[matrix.arch] }}
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +173,7 @@ jobs:
         if: hashFiles('out/node-android-*.tar.xz') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: node-android-${{ matrix.arch }}-${{ env.NODE_VER }}
+          name: node-android-${{ matrix.arch }}-${{ env.ARCH_ABI }}-${{ env.NODE_VER }}
           path: out/node-android-*.tar.xz
           if-no-files-found: error
 
@@ -180,11 +184,11 @@ jobs:
         uses: ncipollo/release-action@v1.21.0
         with:
           tag: node-android-${{ matrix.arch }}-${{ env.NODE_MAJOR }}
-          name: Node.js for Android (${{ matrix.arch }}) - ${{ env.NODE_MAJOR }}.x
+          name: Node.js for Android - ${{ matrix.arch }} (${{ env.ARCH_LABEL }}, ${{ env.ARCH_ABI }}) - ${{ env.NODE_MAJOR }}.x
           artifacts: out/node-android-*.tar.xz
           allowUpdates: true
           replacesArtifacts: false
           body: |
-            Node.js for Android (${{ matrix.arch }}), node ${{ env.NODE_MAJOR }}.x 系列, 自包含二进制 (--partly-static)
+            Node.js for Android - ${{ matrix.arch }} = ${{ env.ARCH_LABEL }} (ABI: ${{ env.ARCH_ABI }}), node ${{ env.NODE_MAJOR }}.x 系列, 自包含二进制 (--partly-static)
             本 release 按大版本归档: 每个小版本一个 asset (node-android-<arch>-<version>.tar.xz), 历史版本全部保留
             构建记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
