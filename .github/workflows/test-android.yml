@@ -1,0 +1,60 @@
+name: Test Node.js on Android Emulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_major:
+        description: 'Node major version (release tag), contoh: 24'
+        default: '24'
+        required: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # x64 = kontrol (emulator native). arm64 & arm = lewat ARM translation.
+        arch: [x64, arm64, arm]
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download ${{ matrix.arch }} build from Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dl && cd dl
+          gh release download "node-android-${{ matrix.arch }}-${{ inputs.node_major || '24' }}" \
+            --repo "${{ github.repository }}" --pattern '*.tar.xz'
+          ls -lh
+          tar xf *.tar.xz
+          ls -R . | head -30
+
+      - name: Write test script
+        run: |
+          cat > run-test.sh <<'EOF'
+          set -x
+          adb wait-for-device
+          adb shell getprop ro.product.cpu.abilist
+          DIR=$(ls -d dl/nodejs-v*-android-$ARCH | head -n 1)
+          adb push "$DIR" /data/local/tmp/nodetest
+          adb shell chmod 755 /data/local/tmp/nodetest/bin/node
+          adb shell '/data/local/tmp/nodetest/bin/node -v; echo EXIT=$?' | tee v.txt
+          grep -q 'EXIT=0' v.txt || exit 1
+          adb shell 'cd /data/local/tmp/nodetest && ./bin/node smoke-test.js; echo EXIT=$?' | tee smoke.txt
+          grep -q 'EXIT=0' smoke.txt || exit 1
+          EOF
+
+      - name: Run in emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ARCH: ${{ matrix.arch }}
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          script: bash run-test.sh
