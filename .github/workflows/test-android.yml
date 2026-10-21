@@ -106,7 +106,23 @@ jobs:
           adb shell '/data/local/tmp/nodetest/bin/node -v; echo EXIT=$?' | tee v.txt
           grep -q 'EXIT=0' v.txt || exit 1
           adb shell 'cd /data/local/tmp/nodetest && ./bin/node smoke-test.js; echo EXIT=$?' | tee smoke.txt
-          grep -q 'EXIT=0' smoke.txt || exit 1
+          if grep -q 'EXIT=0' smoke.txt; then exit 0; fi
+          echo "=== smoke-test gagal. Diagnosa: tiap fitur dijalankan di proses terpisah ==="
+          cat > diag.txt <<'DIAG'
+          1+1
+          typeof Intl
+          new Intl.DateTimeFormat('en').format(new Date(0))
+          new Intl.DateTimeFormat('ja-JP',{timeZone:'Asia/Tokyo',dateStyle:'full'}).format(new Date(0))
+          new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR'}).format(1234.5)
+          [...new Intl.Segmenter('en',{granularity:'word'}).segment('hello big world')].length
+          'abc'.localeCompare('abd','de')
+          process.versions.icu
+          DIAG
+          adb push diag.txt /data/local/tmp/diag.txt
+          adb shell 'while IFS= read -r l; do echo "### $l"; /data/local/tmp/nodetest/bin/node -p "$l"; echo "EXIT=$?"; done < /data/local/tmp/diag.txt'
+          echo "=== sama, tapi dengan --jitless (tanpa JIT) ==="
+          adb shell '/data/local/tmp/nodetest/bin/node --jitless -p "new Intl.DateTimeFormat(\"en\").format(new Date(0))"; echo EXIT=$?'
+          exit 1
           EOF
 
       - name: "Run in emulator: ${{ matrix.label }}"
